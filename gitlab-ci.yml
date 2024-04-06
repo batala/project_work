@@ -1,0 +1,117 @@
+variables:
+  DEPLOY_ONLY_NAR: "true"
+
+stages:
+  - test-java
+  - build-java
+  - deploy-java
+  - copy-artifact
+
+.ssh: &ssh
+  - |
+    eval $(ssh-agent -s)
+    echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add - > /dev/null
+    mkdir -p ~/.ssh
+    chmod 700 ~/.ssh
+
+.apply_template: &build_deploy
+  image: /gitlab-runners/maven-deploy:release-2.0.6
+
+.before_script: &before_script
+  - |
+    export PROJECT_VERSION="$(xmllint --xpath '/*[local-name()="project"]/*[local-name()="version"]/text()' pom.xml)"
+    export PROJECT_PATH="$(xmllint --xpath '/*[local-name()="project"]/*[local-name()="modules"]/*[local-name()="module"]' pom.xml | cut -d '<' -f4|cut -d '>' -f2)"
+    date
+    [[ -z $PROJECT_VERSION ]] && { echo "Unable to determite the PROJECT_VERSION. Exiting." ; exit 1; }
+    echo "Project version after script is ${PROJECT_VERSION}"
+    echo "Project version path after script is ${PROJECT_PATH}"
+
+.build: &build
+  - |
+    echo Project version is ${PROJECT_VERSION}
+    mvn package -Dmaven.test.skip=true || { echo "Maven build failed" && exit 1; }
+    CHECKPATH=`pwd`/${PROJECT_PATH##*/}/target
+    COUNT_NAR=`ls -1 $CHECKPATH/*.nar 2>/dev/null | wc -l`
+    if [ $COUNT_NAR != 0 ]; then
+        CHECKNAME=${CI_PROJECT_NAME}-"nar"-${PROJECT_VERSION}.nar
+        echo "[INFO] check the final name to equal the template name ${CHECKNAME}"
+        if [ ! -f ${CHECKPATH}/${CHECKNAME} ]; then
+            echo "[ERROR] The final name of jar must be equal with ${CHECKNAME}"
+            echo "[INFO] Contents of target after build "${CHECKPATH} && ls -l ${CHECKPATH}
+            exit 1
+        else
+            echo "[INFO] The final name ${CHECKNAME} is correct"
+        fi
+    fi
+
+cache:
+  key: "$CI_PROJECT_NAME:$CI_PIPELINE_ID"
+  paths:
+    - target
+    - ./*/target
+
+maven-test:
+  stage: test-java
+  <<: *build_deploy
+  script:
+    - mvn test
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^stage-*/
+
+maven-build:
+  stage: build-java
+  <<: *build_deploy
+  script:
+    - *before_script
+    - *build
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^stage-*/
+
+maven-deploy:
+  stage: deploy-java
+  <<: *build_deploy
+  script:
+    - *before_script
+    - |
+      echo "<settingsSecurity><master>{${MAVEN_MASTER}}</master></settingsSecurity>" > /root/.m2/settings-security.xml
+      mvn deploy
+  rules:
+    - if: $DEPLOY_ONLY_NAR != "true" && $CI_COMMIT_TAG =~ /^release-*/
+      when: manual
+
+
+maven-deploy-nar:
+  image: /gitlab-runners/maven-deploy:release-2.0.6
+  stage: deploy-java
+  script:
+    - *before_script
+    - *build
+    - |
+      echo "<settingsSecurity><master>{${MAVEN_MASTER}}</master></settingsSecurity>" > /root/.m2/settings-security.xml
+      mvn deploy:deploy-file \
+          -Durl=https://nexus-repo.dmp.vimpelcom.ru/repository/nifi_releases_ \
+          -DrepositoryId=nexus-releases \
+          -DgroupId=ru.beeline.nifi \
+          -DartifactId=${CI_PROJECT_NAME}-"nar" \
+          -DgeneratePom=false \
+          -Dversion=${PROJECT_VERSION} \
+          -Dfile=`pwd`/${CI_PROJECT_NAME}-"nar"/target/${CI_PROJECT_NAME}-"nar"-${PROJECT_VERSION}.nar
+  rules:
+    - if: $DEPLOY_ONLY_NAR == "true" && $CI_COMMIT_TAG =~ /^release-*/
+      when: manual
+
+copy artifact to nifi libs:
+  image: nexus-repo.dmp.vimpelcom.ru/gitlab-runners/cd-deployment:release-1.7.7
+  stage: copy-artifact
+  before_script:
+    - *ssh
+  script:
+    - |
+      NIFI_PATH_LIBS=/opt/nifi/libs
+      for server in $HOSTS_DEV
+      do
+         rsync -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" -av --stats --progress --ignore-existing ./${CI_PROJECT_NAME}-"nar"/target/${CI_PROJECT_NAME}-"nar"-*.nar $USER@$server:${NIFI_PATH_LIBS}
+      done
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^stage-*/
+      when: manual
